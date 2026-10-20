@@ -46,6 +46,130 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
+describe('response body size limit', () => {
+  const cap = 1_048_576;
+  const encoder = new TextEncoder();
+
+  function streamResponse(chunks: Uint8Array[], cancel = vi.fn(), status = 200) {
+    let index = 0;
+    const pull = vi.fn((controller: ReadableStreamDefaultController<Uint8Array>) => {
+      const chunk = chunks[index++];
+      if (chunk === undefined) controller.close();
+      else controller.enqueue(chunk);
+    });
+    const response = new Response(new ReadableStream({ pull, cancel }, { highWaterMark: 0 }), {
+      status,
+    });
+    return { response, pull, cancel };
+  }
+
+  it('accepts JSON whose UTF-8 body is exactly 1 MiB', async () => {
+    const value = 'x'.repeat(cap - JSON.stringify({ data: '' }).length);
+    fetchMock.mockResolvedValue(jsonResponse(200, { data: value }));
+    await expect(apiRequest('groups')).resolves.toBe(value);
+  });
+
+  it('rejects a body one byte over the limit with a clear ApiError', async () => {
+    fetchMock.mockResolvedValue(new Response('x'.repeat(cap + 1)));
+    await expect(apiRequest('groups')).rejects.toMatchObject({
+      name: 'ApiError',
+      status: 200,
+      code: 'response_too_large',
+      message: expect.stringMatching(/1048576.*byte.*limit/i),
+    });
+  });
+
+  it('cancels an oversized chunked stream before requesting more data', async () => {
+    const { response, pull, cancel } = streamResponse([
+      new Uint8Array(cap),
+      new Uint8Array(1),
+      encoder.encode('must not be read'),
+    ]);
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).rejects.toMatchObject({ code: 'response_too_large' });
+    expect(pull).toHaveBeenCalledTimes(2);
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(response.body?.locked).toBe(false);
+  });
+
+  it('counts UTF-8 bytes rather than JavaScript string characters', async () => {
+    const text = JSON.stringify({ data: '😀'.repeat(cap / 4) });
+    expect(text.length).toBeLessThan(cap);
+    fetchMock.mockResolvedValue(new Response(text));
+    await expect(apiRequest('groups')).rejects.toMatchObject({ code: 'response_too_large' });
+  });
+
+  it('preserves UTF-8 code points split across stream chunks without using response.text', async () => {
+    const body = encoder.encode('\uFEFF' + JSON.stringify({ data: 'café 😀' }));
+    const { response } = streamResponse(Array.from(body, (byte) => new Uint8Array([byte])));
+    const text = vi.spyOn(response, 'text');
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).resolves.toBe('café 😀');
+    expect(text).not.toHaveBeenCalled();
+    expect(response.body?.locked).toBe(false);
+  });
+
+  it('does not let an understated Content-Length bypass the streamed byte limit', async () => {
+    const response = new Response('x'.repeat(cap + 1), { headers: { 'content-length': '1' } });
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).rejects.toMatchObject({ code: 'response_too_large' });
+  });
+
+  it('uses the actual body size rather than rejecting a small body on an overstated header', async () => {
+    const response = jsonResponse(200, { data: 'small' });
+    response.headers.set('content-length', String(cap + 1));
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).resolves.toBe('small');
+  });
+
+  it.each([apiRequestPage, apiRequestPageBody])(
+    'caps paginated callers too (%#)',
+    async (request) => {
+      fetchMock.mockResolvedValue(new Response('x'.repeat(cap + 1)));
+      await expect(request('groups')).rejects.toMatchObject({ code: 'response_too_large' });
+    },
+  );
+
+  it('reports an oversized error body clearly without making it retryable', async () => {
+    fetchMock.mockResolvedValue(new Response('x'.repeat(cap + 1), { status: 502 }));
+    const error = await apiRequest('groups').catch((failure: unknown) => failure);
+    expect(error).toMatchObject({ status: 502, code: 'response_too_large' });
+    expect(apiErrorMessage(error)).toBe('The server response was too large.');
+    expect(isRetryableApiError(error)).toBe(false);
+  });
+
+  it('preserves an abort raised while reading the body and releases the reader', async () => {
+    const abort = new DOMException('aborted', 'AbortError');
+    const response = new Response(
+      new ReadableStream({
+        pull(controller) {
+          controller.error(abort);
+        },
+      }),
+    );
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).rejects.toBe(abort);
+    expect(response.body?.locked).toBe(false);
+  });
+
+  it('does not let failed stream cancellation hide the size error', async () => {
+    const cancel = vi.fn().mockRejectedValue(new Error('cancel failed'));
+    const { response } = streamResponse([new Uint8Array(cap + 1)], cancel);
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).rejects.toMatchObject({ code: 'response_too_large' });
+    expect(cancel).toHaveBeenCalledTimes(1);
+  });
+
+  it('rejects overflow without waiting for stream cancellation to finish', async () => {
+    const cancel = vi.fn(() => new Promise<void>(() => undefined));
+    const { response } = streamResponse([new Uint8Array(cap + 1)], cancel);
+    fetchMock.mockResolvedValue(response);
+    await expect(apiRequest('groups')).rejects.toMatchObject({ code: 'response_too_large' });
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(response.body?.locked).toBe(false);
+  });
+});
+
 describe('apiRequest', () => {
   it('unwraps the data envelope', async () => {
     fetchMock.mockResolvedValue(jsonResponse(200, { data: { code: 'abc' } }));

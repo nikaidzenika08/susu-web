@@ -84,15 +84,47 @@ function url(path: string): string {
   return `${base.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
 }
 
+/** Maximum decoded response-body size, measured in UTF-8 bytes (1 MiB). */
+const MAX_RESPONSE_BODY_BYTES = 1_048_576;
+
+async function readTextBounded(response: Response): Promise<string> {
+  if (response.body === null) return '';
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let bytes = 0;
+  let text = '';
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) return text + decoder.decode();
+      if (value.byteLength > MAX_RESPONSE_BODY_BYTES - bytes) {
+        // Stop requesting bytes immediately. Cancellation can itself fail or
+        // remain pending; neither may hide or delay the useful size error.
+        void reader.cancel().catch(() => undefined);
+        throw new ApiError(
+          response.status,
+          'response_too_large',
+          `The server response exceeds the ${MAX_RESPONSE_BODY_BYTES}-byte limit.`,
+        );
+      }
+      bytes += value.byteLength;
+      text += decoder.decode(value, { stream: true });
+    }
+  } finally {
+    reader.releaseLock();
+  }
+}
+
 /**
- * Reads a response body as JSON, or `undefined` if it is not JSON.
+ * Reads a bounded response body as JSON, or `undefined` if it is not JSON.
  *
  * A 502 from a proxy is HTML, and `response.json()` on it throws a `SyntaxError`
  * that says nothing about the actual problem. Returning `undefined` lets the
  * caller report the status, which is the informative part.
  */
 async function readJson(response: Response): Promise<unknown> {
-  const text = await response.text();
+  const text = await readTextBounded(response);
   if (text.length === 0) return undefined;
   try {
     return JSON.parse(text) as unknown;

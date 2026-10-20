@@ -277,6 +277,18 @@ pnpm test
 pnpm build
 ```
 
+### API response size
+
+The HTTP client accepts at most **1 MiB (1,048,576 bytes)** per response body,
+including error responses. It counts the bytes delivered by the browser's response
+stream, after HTTP content decoding, rather than trusting `Content-Length` or
+counting JavaScript characters. A body exactly at the limit is accepted.
+
+On overflow, the client cancels the reader and throws an `ApiError` with code
+`response_too_large`; this error is not automatically retryable. Empty responses,
+normal JSON, non-JSON HTTP errors, and request cancellation keep their existing
+behavior. The limit applies to all three API request helpers.
+
 ## Configuration
 
 All configuration is browser-visible. **Only the Supabase publishable/anon key may appear in

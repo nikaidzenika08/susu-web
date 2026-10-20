@@ -44,11 +44,13 @@ export class ApiError extends Error {
  */
 export function isRetryableApiError(error: unknown): boolean {
   if (!(error instanceof ApiError)) return false;
+  if (error.code === 'response_too_large') return false;
   if (error.status === 0) return true;
   return error.status >= 500 || error.status === 429;
 }
 
 const MESSAGES: Record<string, string> = {
+  response_too_large: 'The server response was too large.',
   invalid_request: 'That request was not something the server could accept.',
   unauthorized: 'Your session has expired. Sign in again and retry.',
   forbidden: 'This account is not allowed to do that.',
